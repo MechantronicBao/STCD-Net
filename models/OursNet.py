@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional
 import torch.nn.functional as F
 from functools import partial
+
 from models.help_funcs import TwoLayerConv2d, save_to_mat
 import torch.nn.functional as F
 import warnings
@@ -582,6 +583,48 @@ class conv_block(nn.Module):
         x = self.conv(x)
         return x
 
+# SGE注意力机制
+class SpatialGroupEnhance(nn.Module):
+    def __init__(self, groups=8):
+        super().__init__()
+        self.groups = groups
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.weight = nn.Parameter(torch.zeros(1, groups, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(1, groups, 1, 1))
+        self.sig = nn.Sigmoid()
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                init.constant_(m.weight, 1)
+                init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x = x.view(b * self.groups, -1, h, w)  # bs*g,dim//g,h,w
+        xn = x * self.avg_pool(x)  # bs*g,dim//g,h,w
+        xn = xn.sum(dim=1, keepdim=True)  # bs*g,1,h,w
+        t = xn.view(b * self.groups, -1)  # bs*g,h*w
+
+        t = t - t.mean(dim=1, keepdim=True)  # bs*g,h*w
+        std = t.std(dim=1, keepdim=True) + 1e-5
+        t = t / std  # bs*g,h*w
+        t = t.view(b, self.groups, h, w)  # bs,g,h*w
+
+        t = t * self.weight + self.bias  # bs,g,h*w
+        t = t.view(b * self.groups, 1, h, w)  # bs*g,1,h*w
+        x = x * self.sig(t)
+        x = x.view(b, c, h, w)
+        return x
 
 class Attention_block(nn.Module):
 
@@ -609,20 +652,27 @@ class Attention_block(nn.Module):
             nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
             nn.BatchNorm2d(1), nn.Sigmoid())
 
-        self.relu = nn.ReLU(inplace=True)
+        # self.relu = nn.ReLU(inplace=True)
+        self.leaky_relu = nn.LeakyReLU(negative_slope=0.2, inplace=True)  # 使用LeakyReLU替代ReLU
+        self.sge = SpatialGroupEnhance(8)
 
     def forward(self, g, x):
         g1 = self.W_g(g)
         x1 = self.W_x(x)
-        psi = self.relu(g1 + x1)
+        psi = self.leaky_relu(g1 + x1)
         psi = self.psi(psi)
 
-        return x * psi
+        return self.sge(x) * psi
 
-class OursNet(nn.Module):
+
+
+
+
+
+class OursNet_SAG(nn.Module):
 
     def __init__(self,input_nc=3, output_nc=2, channel_list=[64, 128, 256, 320, 512, 640], decoder_softmax=False, convTranspose = True,output_sigmoid=True):
-        super(OursNet, self).__init__()
+        super(OursNet_SAG, self).__init__()
         self.Tenc = Tenc()
 
         self.convproj = convprojection_base()
@@ -672,7 +722,6 @@ class OursNet(nn.Module):
         fx2 = self.Tenc(x2)
 
 
-        # 差分特征图
         DI1 = torch.abs(fx1[0] - fx2[0])
 
         DI2 = torch.abs(fx1[1] - fx2[1])
@@ -681,7 +730,6 @@ class OursNet(nn.Module):
 
         DI4 = torch.abs(fx1[3] - fx2[3])
 
-        # 解码器
         d4 = self.Up4(DI4)
 
         d3 = d4
@@ -724,18 +772,6 @@ class OursNet(nn.Module):
 
         outputs = []
         outputs.append(dzl)
-
+        #outputs = torch.argmax(dzl,dim=1)
         return outputs
 
-
-
-if __name__ == '__main__':
-    net = OursNet(input_nc=3, output_nc=2)
-    a = torch.randn(2, 3, 1024, 1024)
-    b = torch.randn(2, 3, 1024, 1024)
-    start_time = time.time()
-    y = net(a, b)
-    end_time = time.time()
-    total_time = end_time - start_time
-    print("预测时间：", total_time, "s")
-    print(y.shape)
